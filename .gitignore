@@ -1,4 +1,5 @@
-*.md
+# Don't ignore Markdown files, we need those for AI agent coding work.
+# *.md
 .DS_Store
 **/.DS_Store
 .idea/
