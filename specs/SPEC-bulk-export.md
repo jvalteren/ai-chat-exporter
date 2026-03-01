@@ -152,101 +152,80 @@ class ProjectConversationLoader {
 
 **Goal**: Extract full conversation content from each conversation link
 
-**Chosen Approach: Navigation-Based (reuse existing export logic)**
+**Chosen Approach: Navigation-Based (reuse existing `ExportService` from `chatgpt.js`)**
 
-- Click each conversation link sequentially
-- Wait for page to load
-- Extract content using existing ChatGPT extraction logic
-- Navigate back to project overview
-- Repeat for next conversation
+**Key design decisions:**
+
+- Conversation info (title, url, date) is extracted into a plain JS array **before** any navigation begins — no DOM references are held across page transitions (fixes stale-ref bug)
+- Navigation uses SPA-friendly `link.click()` where possible; falls back to `window.location.href`
+- Back-navigation uses `history.back()` with DOM polling to verify arrival; falls back to direct URL if the panel doesn't appear within the timeout
+- Extraction calls `ExportService.buildMarkdown(turns, title, exportAll = true)` — no checkboxes needed or injected
 
 ```javascript
-class ProjectConversationExtractor {
-  async extractAllConversations(conversationList, showProgress = true) {
-    const conversations = [];
-    const totalCount = conversationList.length;
-    
-    for (let i = 0; i < totalCount; i++) {
-      const item = conversationList[i];
-      const info = this.extractConversationInfo(item);
-      
-      if (showProgress) {
-        Utils.createNotification(`Extracting (${i + 1}/${totalCount}): ${info.title}`);
-      }
-      
-      try {
-        // Click to navigate to conversation
-        const link = item.querySelector('a');
-        link.click();
-        
-        // Wait for page to load
-        await Utils.sleep(1500);
-        
-        // Extract using existing logic
-        const turns = Array.from(
-          document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN)
-        );
-        const content = await this.extractConversationContent(turns, info.title);
-        
-        conversations.push({
-          title: info.title,
-          url: info.url,
-          createdDate: info.createdDate,
-          content: content,
-          turns: turns.length
-        });
-        
-        // Navigate back to project overview
-        window.history.back();
-        await Utils.sleep(1000);
-        
-      } catch (error) {
-        console.error(`Failed to extract conversation: ${info.title}`, error);
-        conversations.push({
-          title: info.title,
-          error: error.message,
-          content: `[Failed to extract: ${error.message}]`
-        });
-      }
+// In ProjectConversationLoader — call this BEFORE starting navigation
+getConversationInfoList() {
+  const panel = document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL);
+  if (!panel) return [];
+  return Array.from(
+    panel.querySelectorAll(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_LIST_ITEM)
+  ).map(item => this.extractConversationInfo(item));
+  // Returns plain { title, url, date } objects — no DOM refs
+}
+
+// In ProjectExportController.runExport()
+async runExport() {
+  await this.loader.loadAllConversations();
+  const conversationList = this.loader.getConversationInfoList(); // snapshot before nav
+
+  for (let i = 0; i < conversationList.length; i++) {
+    const info = conversationList[i]; // plain object, never goes stale
+    Utils.createNotification(`Extracting (${i + 1}/${conversationList.length}): ${info.title}`);
+
+    try {
+      await this._navigateToConversation(info);
+      const turns = Array.from(document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN));
+      // exportAll = true bypasses checkbox checks — extracts every turn unconditionally
+      const markdown = await this.exportService.buildMarkdown(turns, info.title, true);
+      folder.file(`${Utils.sanitizeFilename(info.title)}_${Utils.getDateString()}.md`, markdown);
+    } catch (error) {
+      console.error(`Failed to extract "${info.title}":`, error);
+      folder.file(`${Utils.sanitizeFilename(info.title)}_ERROR.md`, `[Failed to extract: ${error.message}]`);
     }
-    
-    return conversations;
+
+    await this._navigateBackToProject();
   }
-  
-  async extractConversationContent(turns, title) {
-    let markdown = `## ${title}\n\n`;
-    
-    for (let i = 0; i < turns.length; i++) {
-      const turn = turns[i];
-      
-      // User message
-      const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
-      const userCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.user`);
-      if (userHeading && userCheckbox?.checked) {
-        const userContent = userHeading.nextElementSibling?.textContent?.trim();
-        markdown += userContent
-          ? `**You**: ${userContent}\n\n`
-          : `**You**: [Unable to extract]\n\n`;
-      }
-      
-      // Model message
-      const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
-      const modelCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.model`);
-      if (modelHeading && modelCheckbox?.checked) {
-        const copyBtn = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
-        if (copyBtn) {
-          const clipboardText = await this.copyModelResponse(copyBtn);
-          markdown += clipboardText
-            ? `**ChatGPT**: ${clipboardText}\n\n`
-            : `**ChatGPT**: [Unable to extract]\n\n`;
-        }
-      }
-      
-      markdown += '---\n\n';
-    }
-    
-    return markdown;
+}
+
+async _navigateToConversation(info) {
+  if (!info.url) throw new Error('No URL for conversation');
+  const pathname = new URL(info.url).pathname;
+  const link = document.querySelector(`a[href="${pathname}"]`); // SPA-friendly
+  if (link) {
+    link.click();
+  } else {
+    window.location.href = info.url;
   }
+  const found = await this._waitForElement(CONFIG.SELECTORS.CONVERSATION_TURN, 10000);
+  if (!found) throw new Error(`Timed out loading conversation: ${info.title}`);
+}
+
+async _navigateBackToProject() {
+  window.history.back();
+  const ok = await this._waitForElement(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL, 5000);
+  if (!ok) {
+    // history.back() didn't land on project overview — navigate directly
+    window.location.href = this.projectUrl;
+    await this._waitForElement(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL, 8000);
+  }
+}
+
+async _waitForElement(selector, maxWaitMs) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    if (document.querySelector(selector)) return true;
+    await Utils.sleep(200);
+  }
+  return false;
 }
 ```
 
@@ -292,19 +271,21 @@ async downloadAsZip(conversations, projectName) {
 
 **Fallback Delivery: Sequential Downloads**
 
+If ZIP generation fails, each file is downloaded individually using the same blob/anchor
+pattern from `ExportService.export()` in `chatgpt.js` (no separate `FileExportService`
+needed — that class only exists in `gemini.js`):
+
 ```javascript
-async downloadMultipleFiles(conversations, projectName) {
-  for (let i = 0; i < conversations.length; i++) {
-    const conv = conversations[i];
-    const filename = `${projectName}_${conv.title}_${DateUtils.getDateString()}`;
-    
-    FileExportService.downloadMarkdown(conv.content, filename);
-    
-    // Stagger downloads to avoid browser blocking
-    if (i < conversations.length - 1) {
-      await Utils.sleep(500);
-    }
-  }
+// Inline blob/anchor download — mirrors ExportService.export() in chatgpt.js
+function downloadMarkdown(content, filename) {
+  const blob = new Blob([content], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${filename}.md`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  setTimeout(() => { document.body.removeChild(anchor); URL.revokeObjectURL(url); }, 1000);
 }
 ```
 
@@ -449,22 +430,22 @@ src/
 ```javascript
 const CONFIG = {
   // ... existing config ...
-  
+
   PROJECT_EXPORT: {
     MAX_LOAD_ATTEMPTS: 60,
     LOAD_DELAY: 2000,
-    CONVERSATION_EXTRACT_DELAY: 1500,
-    BACK_NAVIGATION_DELAY: 1000,
-    BATCH_DOWNLOAD_DELAY: 500,
-    EXTRACTION_RETRY_ATTEMPTS: 3,
+    CONVERSATION_LOAD_TIMEOUT: 10000, // poll timeout waiting for conversation turns
+    BACK_NAVIGATION_DELAY: 5000,      // poll timeout waiting for chats panel on return
+    MAX_CONVERSATIONS_WITHOUT_WARNING: 50,
+    BUTTON_ID: 'chatgpt-project-export-btn',
     SELECTORS: {
       PROJECT_TABS: '[id^="project-home-tabs-"]',
       CHATS_PANEL: '[role="tabpanel"][id*="content-chats"]',
       CONVERSATION_LIST_ITEM: 'li.group\\/project-item',
       CONVERSATION_TITLE: '.text-sm.font-medium',
       CONVERSATION_DATE: '[data-testid="project-conversation-overflow-date"]',
-      CONVERSATION_LINK: 'li.group\\/project-item > a[href*="/c/"]',
-      LOAD_MORE_BUTTON_CANDIDATE: 'button.btn'
+      CONVERSATION_LINK: 'a[href*="/c/"]',
+      LOAD_MORE_BUTTON: 'button.btn'  // confirmed: button has class "btn" in live DOM
     }
   }
 };
@@ -651,31 +632,69 @@ This specification provides a comprehensive, phased approach to extending the AI
 
 The MVP scope focuses on core functionality (loading all conversations and exporting to multiple per-conversation files with ZIP delivery and sequential fallback), with enhanced features (parallel processing) available in subsequent phases.
 
-## 13. Testing Strategy (Pragmatic)
+## 13. Testing Strategy (TDD)
 
-**Goal**: Validate selector stability, export correctness, and user-visible reliability without exhaustive automation.
+**Rationale**: ChatGPT's DOM is a moving target — selectors break silently when the UI updates.
+TDD encodes the current selector knowledge as executable tests so breakage is caught before deploy,
+not after user reports.
 
-**Layers**:
+### TDD Order
 
-1. **DOM Snapshot Validation** (static)
-   - Re-validate selectors against stored snapshots (like [`specs/project-overview.html`](specs/project-overview.html)).
-   - Verify key anchors: project tabs, chats panel, list items, load-more button text.
-2. **Manual Smoke Tests** (primary)
-   - Run through export on small (1–3), medium (10–20), and large (50+) project sizes.
-   - Validate ZIP contents and file naming patterns.
-   - Confirm UI visibility only on project overview pages.
-3. **Failure Mode Checks**
-   - Simulate load-more failure (disable button, slow network) and ensure graceful messaging.
-   - Force navigation interruption mid-export and confirm cancel/rollback behavior.
-4. **Regression Guardrails**
-   - Maintain a short checklist aligned to the DOM-dependent selectors.
-   - Re-run after any upstream UI changes or selector updates.
+1. **Write selector tests first** (red → green against existing snapshot) — establishes baseline
+2. **Write `buildMarkdown` unit tests** for `exportAll` flag before implementing it (red) — implementation makes them green
+3. **Implement feature** — iterate until all tests pass
 
-**Exit Criteria**:
+### Test Infrastructure
 
-- 0 blocking failures on manual smoke tests.
-- No empty files in ZIP for successful conversation extractions.
-- Export completes with correct count and filenames.
+```text
+package.json            — Jest + jsdom (run with: npm test)
+tests/
+  selectors.test.js     — validates all PROJECT_EXPORT selectors against project-overview.html
+  buildMarkdown.test.js — validates exportAll extracts all turns without checkboxes
+```
+
+### `tests/selectors.test.js`
+
+Loads [`specs/project-overview.html`](specs/project-overview.html) into jsdom and asserts:
+
+- `CHATS_PANEL` selector matches exactly one element
+- `CONVERSATION_LIST_ITEM` matches ≥ 1 items
+- Each list item contains an `<a href>` containing `/c/`
+- Each list item contains a `.text-sm.font-medium` element with non-empty text
+- Each list item contains a `[data-testid="project-conversation-overflow-date"]`
+- At least one `button.btn` contains the text "Load more conversations"
+- `isProjectOverviewPage()` returns `true` for a URL matching `/g/g-p-.../project`
+
+### `tests/buildMarkdown.test.js`
+
+Constructs minimal mock `<article>` turn elements (with `h5.sr-only` / `h6.sr-only` headings) and asserts:
+
+- `exportAll = false`, no checkboxes → output contains no user/model content (existing behaviour preserved)
+- `exportAll = true`, no checkboxes → output contains user message text and model copy-button call for every turn
+
+### Manual Smoke Tests
+
+Run after any selector or navigation change:
+
+- [ ] Small project (1–3 conversations): ZIP downloads, each `.md` is non-empty
+- [ ] Medium project (10–20 conversations): progress notifications update correctly
+- [ ] Large project (50+): warning dialog appears before extraction begins
+- [ ] Cancel mid-export: no ZIP downloaded, button re-enabled
+- [ ] Failed conversation (e.g. deleted mid-export): error placeholder in ZIP, export continues
+- [ ] "Export Project" button absent on regular conversation pages
+- [ ] "Export Chat" button absent on project overview pages
+
+### Regression Guardrails
+
+- Re-run `npm test` after any upstream ChatGPT UI change
+- Update `specs/project-overview.html` snapshot when selectors change, then fix tests before fixing code
+- Keep selector constants in `CONFIG.PROJECT_EXPORT.SELECTORS` as the single source of truth — tests and implementation both import from there
+
+### Exit Criteria
+
+- `npm test` passes with 0 failures
+- No empty `.md` files in ZIP for successfully extracted conversations
+- Export completes reporting correct count and filenames
 
 ## 14. Finalized Decisions
 

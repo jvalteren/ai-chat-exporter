@@ -55,6 +55,24 @@
       LIGHT_BG: '#fff',
       LIGHT_TEXT: '#222',
       LIGHT_BORDER: '#ccc'
+    },
+
+    PROJECT_EXPORT: {
+      MAX_LOAD_ATTEMPTS: 60,
+      LOAD_DELAY: 2000,
+      BACK_NAVIGATION_DELAY: 5000,
+      CONVERSATION_LOAD_TIMEOUT: 10000,
+      MAX_CONVERSATIONS_WITHOUT_WARNING: 50,
+      BUTTON_ID: 'chatgpt-project-export-btn',
+      SELECTORS: {
+        PROJECT_TABS: '[id^="project-home-tabs-"]',
+        CHATS_PANEL: '[role="tabpanel"][id*="content-chats"]',
+        CONVERSATION_LIST_ITEM: 'li.group\\/project-item',
+        CONVERSATION_LINK: 'a[href*="/c/"]',
+        CONVERSATION_TITLE: '.text-sm.font-medium',
+        CONVERSATION_DATE: '[data-testid="project-conversation-overflow-date"]',
+        LOAD_MORE_BUTTON: 'button.btn'
+      }
     }
   };
 
@@ -383,7 +401,7 @@
       return `chatgpt_chat_export_${baseTimestamp}`;
     }
 
-    async buildMarkdown(turns, title) {
+    async buildMarkdown(turns, title, exportAll = false) {
       let markdown = title
         ? `# ${title}\n\n`
         : '# ChatGPT Chat Export\n\n';
@@ -396,7 +414,7 @@
         // User content comes after the sr-only heading element
         const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
         const userCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.user`);
-        if (userHeading && userCheckbox?.checked) {
+        if (userHeading && (exportAll || userCheckbox?.checked)) {
           const userContent = userHeading.nextElementSibling?.textContent?.trim();
           markdown += userContent
             ? `## 👤 You\n\n${userContent}\n\n`
@@ -405,7 +423,7 @@
 
         const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
         const modelCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.model`);
-        if (modelHeading && modelCheckbox?.checked) {
+        if (modelHeading && (exportAll || modelCheckbox?.checked)) {
           const copyBtn = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
           if (copyBtn) {
             const clipboardText = await this.copyModelResponse(copyBtn);
@@ -458,6 +476,280 @@
       const filenameBase = this.generateFilename(customFilename, title);
 
       await this.export(markdown, mode, filenameBase);
+    }
+  }
+
+  // ============================================================================
+  // PROJECT PAGE DETECTION
+  // ============================================================================
+  function isProjectOverviewPage() {
+    const isProjectUrl = /\/g\/g-p-[^/]+\/project(?:$|\?)/.test(location.pathname + location.search);
+    const hasProjectHeaderTrigger = !!document.querySelector('[data-testid="project-modal-trigger"]');
+    const hasProjectTabs = !!document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.PROJECT_TABS);
+    const hasChatsPanel = !!document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL);
+    return isProjectUrl && hasProjectHeaderTrigger && hasProjectTabs && hasChatsPanel;
+  }
+
+  // ============================================================================
+  // PROJECT CONVERSATION LOADER
+  // ============================================================================
+  class ProjectConversationLoader {
+    async loadAllConversations() {
+      const panel = document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL);
+      if (!panel) throw new Error('Project chats panel not found');
+
+      let loadAttempts = 0;
+      let previousCount = 0;
+      let stableLoads = 0;
+
+      while (stableLoads < 3 && loadAttempts < CONFIG.PROJECT_EXPORT.MAX_LOAD_ATTEMPTS) {
+        const currentCount = panel.querySelectorAll(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_LIST_ITEM).length;
+
+        if (currentCount === previousCount) {
+          stableLoads++;
+        } else {
+          stableLoads = 0;
+          previousCount = currentCount;
+        }
+
+        const loadMoreBtn = Array.from(panel.querySelectorAll(CONFIG.PROJECT_EXPORT.SELECTORS.LOAD_MORE_BUTTON))
+          .find(btn => /load more conversations/i.test(btn.textContent || ''));
+
+        if (!loadMoreBtn || loadMoreBtn.disabled) break;
+
+        Utils.createNotification(`Loading conversations... (${currentCount} loaded)`);
+        loadMoreBtn.click();
+        await Utils.sleep(CONFIG.PROJECT_EXPORT.LOAD_DELAY);
+        loadAttempts++;
+      }
+    }
+
+    extractConversationInfo(element) {
+      const link = element.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_LINK);
+      return {
+        title: element.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_TITLE)?.textContent?.trim() || 'Untitled',
+        url: link?.href || null,
+        date: element.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_DATE)?.textContent?.trim() || null
+      };
+    }
+
+    getConversationInfoList() {
+      const panel = document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL);
+      if (!panel) return [];
+      return Array.from(
+        panel.querySelectorAll(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_LIST_ITEM)
+      ).map(item => this.extractConversationInfo(item));
+    }
+  }
+
+  // ============================================================================
+  // PROJECT EXPORT CONTROLLER
+  // ============================================================================
+  class ProjectExportController {
+    constructor() {
+      this.loader = new ProjectConversationLoader();
+      this.exportService = new ExportService(null);
+      this.button = null;
+      this.cancelRequested = false;
+      this.projectUrl = window.location.href;
+    }
+
+    init() {
+      this.button = this._createButton();
+      document.body.appendChild(this.button);
+      this.button.addEventListener('click', () => this.handleButtonClick());
+      this._observeVisibility();
+    }
+
+    _createButton() {
+      const button = document.createElement('button');
+      button.id = CONFIG.PROJECT_EXPORT.BUTTON_ID;
+      button.textContent = 'Export Project';
+      Object.assign(button.style, {
+        position: 'fixed',
+        top: '80px',
+        right: '20px',
+        zIndex: '9999',
+        padding: '8px 16px',
+        background: CONFIG.STYLES.BUTTON_PRIMARY,
+        color: '#fff',
+        border: 'none',
+        borderRadius: '6px',
+        fontSize: '1em',
+        fontWeight: 'bold',
+        cursor: 'pointer',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+        transition: 'background 0.2s'
+      });
+      button.addEventListener('mouseenter', () => button.style.background = CONFIG.STYLES.BUTTON_HOVER);
+      button.addEventListener('mouseleave', () => button.style.background = CONFIG.STYLES.BUTTON_PRIMARY);
+      return button;
+    }
+
+    async handleButtonClick() {
+      const panel = document.querySelector(CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL);
+      if (!panel) {
+        alert('Could not find the project chats panel.');
+        return;
+      }
+
+      const visibleCount = panel.querySelectorAll(CONFIG.PROJECT_EXPORT.SELECTORS.CONVERSATION_LIST_ITEM).length;
+      if (visibleCount > CONFIG.PROJECT_EXPORT.MAX_CONVERSATIONS_WITHOUT_WARNING) {
+        const proceed = confirm(
+          `This project has at least ${visibleCount} conversations. Export may take several minutes. Continue?`
+        );
+        if (!proceed) return;
+      }
+
+      this.cancelRequested = false;
+      this.button.disabled = true;
+      this.button.textContent = 'Exporting...';
+
+      try {
+        await this.runExport();
+      } catch (error) {
+        console.error('Project export error:', error);
+        alert(`Export failed: ${error.message}`);
+      } finally {
+        this.button.disabled = false;
+        this.button.textContent = 'Export Project';
+      }
+    }
+
+    async runExport() {
+      // Step 1: Load all conversations
+      Utils.createNotification('Loading all conversations...');
+      await this.loader.loadAllConversations();
+      if (this.cancelRequested) return;
+
+      // Step 2: Snapshot info as plain JS objects (no DOM refs)
+      const conversationList = this.loader.getConversationInfoList();
+      const total = conversationList.length;
+
+      if (total === 0) {
+        alert('No conversations found in this project.');
+        return;
+      }
+
+      if (total > CONFIG.PROJECT_EXPORT.MAX_CONVERSATIONS_WITHOUT_WARNING) {
+        const minutes = Math.round(total * 4 / 60);
+        const proceed = confirm(
+          `${total} conversations found. Estimated time: ~${minutes} minutes. Continue?`
+        );
+        if (!proceed) return;
+      }
+
+      const projectTitle = document.querySelector('h1')?.textContent?.trim() || 'project';
+      const zip = new window.JSZip();
+      const folder = zip.folder(Utils.sanitizeFilename(projectTitle));
+      let successCount = 0;
+
+      // Step 3: Navigate to each conversation, extract, navigate back
+      for (let i = 0; i < total; i++) {
+        if (this.cancelRequested) break;
+
+        const info = conversationList[i];
+        Utils.createNotification(`Extracting (${i + 1}/${total}): ${info.title}`);
+
+        try {
+          await this._navigateToConversation(info);
+          const turns = Array.from(document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN));
+          const markdown = await this.exportService.buildMarkdown(turns, info.title, true);
+          const filename = `${Utils.sanitizeFilename(info.title)}_${Utils.getDateString()}.md`;
+          folder.file(filename, markdown);
+          successCount++;
+        } catch (error) {
+          console.error(`Failed to extract "${info.title}":`, error);
+          folder.file(
+            `${Utils.sanitizeFilename(info.title)}_ERROR.md`,
+            `[Failed to extract: ${error.message}]`
+          );
+        }
+
+        await this._navigateBackToProject();
+      }
+
+      if (this.cancelRequested) {
+        alert('Export cancelled.');
+        return;
+      }
+
+      // Step 4: Generate and download ZIP
+      Utils.createNotification('Generating ZIP...');
+      try {
+        const blob = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `${Utils.sanitizeFilename(projectTitle)}_${Utils.getDateString()}.zip`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        setTimeout(() => {
+          document.body.removeChild(anchor);
+          URL.revokeObjectURL(url);
+        }, 1000);
+        alert(`Successfully exported ${successCount} of ${total} conversations.`);
+      } catch (zipError) {
+        console.error('ZIP generation failed:', zipError);
+        alert(`ZIP generation failed: ${zipError.message}`);
+      }
+    }
+
+    async _navigateToConversation(info) {
+      if (!info.url) throw new Error('No URL for conversation');
+      const pathname = new URL(info.url).pathname;
+      const link = document.querySelector(`a[href="${pathname}"]`);
+      if (link) {
+        link.click();
+      } else {
+        window.location.href = info.url;
+      }
+      const found = await this._waitForElement(CONFIG.SELECTORS.CONVERSATION_TURN, CONFIG.PROJECT_EXPORT.CONVERSATION_LOAD_TIMEOUT);
+      if (!found) throw new Error(`Timed out loading conversation: ${info.title}`);
+    }
+
+    async _navigateBackToProject() {
+      window.history.back();
+      const ok = await this._waitForElement(
+        CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL,
+        CONFIG.PROJECT_EXPORT.BACK_NAVIGATION_DELAY
+      );
+      if (!ok) {
+        window.location.href = this.projectUrl;
+        await this._waitForElement(
+          CONFIG.PROJECT_EXPORT.SELECTORS.CHATS_PANEL,
+          CONFIG.PROJECT_EXPORT.BACK_NAVIGATION_DELAY
+        );
+      }
+    }
+
+    async _waitForElement(selector, maxWaitMs) {
+      const start = Date.now();
+      while (Date.now() - start < maxWaitMs) {
+        if (document.querySelector(selector)) return true;
+        await Utils.sleep(200);
+      }
+      return false;
+    }
+
+    _observeVisibility() {
+      const update = () => {
+        try {
+          if (chrome?.storage?.sync) {
+            chrome.storage.sync.get(['hideExportBtn'], (result) => {
+              this.button.style.display = result.hideExportBtn ? 'none' : '';
+            });
+          }
+        } catch (error) {
+          console.error('Storage access error:', error);
+        }
+      };
+      update();
+      if (chrome?.storage?.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'sync' && 'hideExportBtn' in changes) update();
+        });
+      }
     }
   }
 
@@ -590,7 +882,10 @@
   // ============================================================================
   // INIT
   // ============================================================================
-  const controller = new ExportController();
-  controller.init();
+  if (isProjectOverviewPage()) {
+    new ProjectExportController().init();
+  } else {
+    new ExportController().init();
+  }
 
 })();

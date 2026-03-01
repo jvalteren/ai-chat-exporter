@@ -25,6 +25,7 @@ jobs:
           cp src/content_scripts/gemini.js dist/src/content_scripts/
           cp src/content_scripts/chatgpt.js dist/src/content_scripts/
           cp src/lib/turndown.js dist/src/lib/
+          cp src/lib/jszip.min.js dist/src/lib/
           cd dist
           zip -r ../ai-chat-exporter.zip .
 
